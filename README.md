@@ -1,24 +1,52 @@
 # kv-secret-rotation
 
 Azure Function (Python, v2 model) triggered by Key Vault secret events via Event Grid.
-On `SecretNearExpiry` or `SecretExpired`, it generates a new storage SAS token and writes it
-back as a new version of the same secret.
+On `SecretNearExpiry` or `SecretExpired`, it works out what kind of secret it is. Storage SAS
+tokens are rotated automatically (a new SAS is written back as a new version of the same
+secret); every other kind gets a Jira ticket for manual rotation. Rotation for other kinds will
+be added one at a time.
 
-Target: `sri-test` in `bigwx-rg-sri` (Flex Consumption, Python 3.14).
+Target: `kvrot-sri-func` in `bigwx-rg-kvrot-sri` (Flex Consumption, Python 3.14).
 
 ## How rotation works
 
 1. Ignores any event other than `SecretNearExpiry` / `SecretExpired` (stops the
    `SecretNewVersionCreated` loop caused by its own write).
 2. Skips it if the latest version is newer than the one in the event (duplicate delivery).
-3. Works out the settings for the new token (see below), gets key1 of the storage account,
-   signs a new SAS and saves it with the new expiry and the same tags. The new expiry is what
-   makes `SecretNearExpiry` fire again next cycle.
-4. Raises a Jira ticket either way (see below): after a rotation, so an engineer gets the
+3. Works out the secret type (see below).
+4. If the function can rotate that type (today only `storage-sas`), it does, saving the new
+   value with the new expiry and the same tags. The new expiry is what makes `SecretNearExpiry`
+   fire again next cycle.
+5. Raises a Jira ticket either way (see below): after a rotation, so an engineer gets the
    consumers onto the new value; when it can't rotate, so an engineer rotates it manually.
 
 Other errors (throttling, outages, Key Vault access) raise, so Event Grid retries and
 eventually dead-letters the event.
+
+## Secret types
+
+The type comes from, in order:
+
+1. a `secret_type` tag, set to one of the types below (overrides the name)
+2. the name prefix, following the naming standard
+3. the value: a SAS that doesn't follow the naming standard is still `storage-sas`
+4. otherwise `unknown`
+
+| Name | Type | Contains | Rotated automatically |
+|---|---|---|---|
+| `sas-{storage-account}-{container}` | `storage-sas` | SAS token | yes |
+| `spn-{app-name}-{purpose}` | `spn` | service principal client secret | not yet |
+| `db-{server}-{database}` | `database` | database password | not yet |
+| `api-{system}-{purpose}` | `api-key` | API token | not yet |
+| `ext-{vendor}-{keyname}` | `external` | vendor or client credential | not yet |
+| anything else | `unknown` | can't tell | no |
+
+The prefix needs its hyphen, so `dbpassword` is `unknown`. Types without automatic rotation get
+a `manual_rotation_required` ticket whose `action` has the steps for that type.
+
+To add rotation for a type, write a function `(name, value, tags) -> (new value, expiry)` that
+raises `ManualRotationRequired` when it can't rotate, and add it to `ROTATORS` in
+`function_app.py`.
 
 ## Jira tickets
 
@@ -40,7 +68,7 @@ A secret can't be rotated automatically when:
 - the token lifetime is 31 days or less. `SecretNearExpiry` fires 30 days before expiry, so
   a shorter token would be near expiry as soon as it is written and rotate in a loop.
 
-The request is a JSON `POST`. Every ticket has `outcome`, `summary`, `action`, `vaultUrl`,
+The request is a JSON `POST`. Every ticket has `outcome`, `secretType`, `summary`, `action`, `vaultUrl`,
 `secretName`, `secretVersion`, `secretId`, `expiresOn`, `contentType` and `tags`. A `rotated`
 ticket adds `previousVersion`; `secretVersion` and `expiresOn` are those of the new version.
 A `manual_rotation_required` ticket adds `reason` and `eventType`. The secret value is never
@@ -53,22 +81,22 @@ raises no second ticket. A version that couldn't be rotated gets the event type,
 rotated version has no ticket yet and raises it. Neither tag is copied to the next version.
 If the webhook is not configured or the call fails, the function raises so Event Grid retries.
 
-## Where settings come from
+## Where SAS settings come from
 
 Each setting comes from, in order: a tag on the secret, the existing SAS in the secret
-value, then the default. So with no tags, the new token is a copy of the old one with new
+value, the secret name (`sas-{storage-account}-{container}`), then the default. So with no tags, the new token is a copy of the old one with new
 start and expiry times.
 
 | Setting | Tag | From existing SAS | Default |
 |---|---|---|---|
-| Storage account | `storage_account` | URL host (`<account>.blob.core.windows.net`) | required |
+| Storage account | `storage_account` | URL host (`<account>.blob.core.windows.net`), else the name | required |
 | Resource group | `storage_rg` | looked up by account name | |
 | Subscription | `subscription_id` | | `AZURE_SUBSCRIPTION_ID` app setting |
 | Permissions | `permissions` | `sp` | `rl` |
 | Services (account SAS) | `services` | `ss` | `b` |
 | Resource types (account SAS) | `resource_types` | `srt` | `c` |
 | IP filter | `ip` | `sip` | none |
-| Container | `container` | `sr=c` plus URL path | |
+| Container | `container` | `sr=c` plus URL path, else the name | |
 | Blob | | `sr=b` plus URL path | |
 | Lifetime | `expiry_days` | `se - st` of the old token | 180 days |
 | Protocol | | `spr` | any |
@@ -78,8 +106,13 @@ start and expiry times.
 The new value keeps the old shape: a full URL stays a URL with the same path, `?token` keeps
 its `?`, and a bare token stays bare.
 
-A bare token without a `storage_account` tag can't be rotated (there's no account name in it),
-so it raises a Jira ticket, as do user delegation SAS (`skoid`) and stored access policy SAS (`si`).
+Storage account names have no hyphens, so in `sas-{storage-account}-{container}` everything
+after the second hyphen is the container. The name only fills gaps: it never turns an account
+SAS into a container SAS, and a name that disagrees with the SAS URL is logged and ignored.
+
+A value that is not a SAS is never rotated from the name alone, because there is no old token to
+copy permissions from; it needs a `storage_account` tag (and then gets the default settings).
+A bare token with no account in a tag or the name can't be rotated either, so it raises a Jira ticket, as do user delegation SAS (`skoid`) and stored access policy SAS (`si`).
 
 A lifetime taken from the old token is rounded to whole days, so the 15-minute backdated start
 doesn't make each token slightly longer-lived than the last.
