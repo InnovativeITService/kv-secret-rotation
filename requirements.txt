@@ -1,1 +1,5 @@
 azure-functions
+azure-identity
+azure-keyvault-secrets
+azure-mgmt-storage>=25,<26
+azure-storage-blob
