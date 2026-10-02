@@ -1,9 +1,65 @@
 # kv-secret-rotation
 
 Azure Function (Python, v2 model) triggered by Key Vault secret events via Event Grid.
-Currently logs `hello` plus the secret details. SAS rotation logic goes in `kv_secret_expiry`.
+On `SecretNearExpiry` or `SecretExpired`, it generates a new storage SAS token and writes it
+back as a new version of the same secret.
 
 Target: `sri-test` in `bigwx-rg-sri` (Flex Consumption, Python 3.14).
+
+## How rotation works
+
+1. Ignores any event other than `SecretNearExpiry` / `SecretExpired` (stops the
+   `SecretNewVersionCreated` loop caused by its own write).
+2. Reads the secret. Skips it if it has no `storage_account` tag.
+3. Skips it if the latest version is newer than the one in the event (duplicate delivery).
+4. Gets key1 of the storage account, signs a new SAS, and saves it with the new expiry and
+   the same tags. The new expiry is what makes `SecretNearExpiry` fire again next cycle.
+
+Any error raises, so Event Grid retries and eventually dead-letters the event.
+
+## Secret tags
+
+| Tag | Required | Default | Notes |
+|---|---|---|---|
+| `storage_account` | yes | | Storage account name |
+| `storage_rg` | yes | | Storage account resource group |
+| `subscription_id` | no | `AZURE_SUBSCRIPTION_ID` app setting | |
+| `permissions` | no | `rl` | SAS permissions, e.g. `racwdl` |
+| `services` | no | `b` | Account SAS only: `b`, `f`, `q`, `t` |
+| `resource_types` | no | `c` | Account SAS only: `s`, `c`, `o` |
+| `expiry_days` | no | `120` | Lifetime of each new token |
+| `container` | no | | Set to issue a container SAS instead of an account SAS |
+| `ip` | no | | `1.2.3.4` or `1.2.3.4-1.2.3.10` |
+
+```bash
+az keyvault secret set-attributes --vault-name <kv> -n <secret> \
+  --tags storage_account=<sa> storage_rg=<rg> permissions=rl expiry_days=120
+```
+
+The token is stored without a leading `?`.
+
+## Permissions
+
+```bash
+PID=$(az functionapp identity assign -g bigwx-rg-sri -n sri-test --query principalId -o tsv)
+
+# vault using access policies (bigwx-kv-sri)
+az keyvault set-policy -n <kv> --object-id $PID --secret-permissions get set
+
+# vault using Azure RBAC
+az role assignment create --assignee-object-id $PID --assignee-principal-type ServicePrincipal \
+  --role "Key Vault Secrets Officer" --scope $(az keyvault show -n <kv> --query id -o tsv)
+
+# repeat for every storage account it issues tokens for
+az role assignment create --assignee-object-id $PID --assignee-principal-type ServicePrincipal \
+  --role "Storage Account Key Operator Service Role" --scope <storage-account-id>
+
+az functionapp config appsettings set -g bigwx-rg-sri -n sri-test \
+  --settings AZURE_SUBSCRIPTION_ID=<subscription-id>
+```
+
+Check which model a vault uses with
+`az keyvault show -n <kv> --query properties.enableRbacAuthorization`.
 
 ## Deploy
 
