@@ -15,6 +15,9 @@ from azure.storage.blob import generate_account_sas, generate_blob_sas, generate
 
 app = func.FunctionApp()
 
+# The Azure SDK logs every HTTP request and response at INFO; keep only its warnings and errors
+logging.getLogger("azure").setLevel(logging.WARNING)
+
 ROTATE_EVENT_TYPES = {
     "Microsoft.KeyVault.SecretNearExpiry",
     "Microsoft.KeyVault.SecretExpired",
