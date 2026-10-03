@@ -1,5 +1,7 @@
-azure-functions
-azure-identity
-azure-keyvault-secrets
-azure-mgmt-storage>=25,<26
-azure-storage-blob
+# Pinned to the major version tested; a new major can change the API (azure-mgmt-storage 25
+# did, turning `keys` into `keys_property`). Raise a bound only after testing the new version.
+azure-functions>=2.3,<3
+azure-identity>=1.26,<2
+azure-keyvault-secrets>=4.11,<5
+azure-mgmt-storage>=25.2,<26
+azure-storage-blob>=12.31,<13

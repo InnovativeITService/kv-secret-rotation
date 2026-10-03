@@ -11,7 +11,7 @@ from azure.core.exceptions import HttpResponseError
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 from azure.mgmt.storage import StorageManagementClient
-from azure.storage.blob import generate_account_sas, generate_blob_sas, generate_container_sas
+from azure.storage.blob import BlobServiceClient, generate_account_sas, generate_blob_sas, generate_container_sas
 
 app = func.FunctionApp()
 
@@ -109,6 +109,13 @@ ROTATED_FROM_TAG = "rotated_from"
 JIRA_WEBHOOK_URL = "JIRA_WEBHOOK_URL"
 JIRA_WEBHOOK_TOKEN = "JIRA_WEBHOOK_TOKEN"
 
+# App settings: where Event Grid dead-letters events it could not deliver to kv_secret_expiry
+DEADLETTER_ACCOUNT_URL = "DEADLETTER_ACCOUNT_URL"
+DEADLETTER_CONTAINER = "DEADLETTER_CONTAINER"
+
+# Blob metadata set on a dead-letter blob once it has been reported, so it is reported once
+DEADLETTER_REPORTED = "reported"
+
 credential = DefaultAzureCredential()
 
 
@@ -183,6 +190,42 @@ def kv_secret_expiry(event: func.EventGridEvent):
     logging.info("Rotated %s: new version %s expires %s", secret_name, new.properties.version, expiry.isoformat())
     # Jira disabled while testing rotation; uncomment to raise tickets again
     # ticket_rotated(secrets, new.properties, secret_type)
+
+
+@app.timer_trigger(schedule="0 */15 * * * *", arg_name="timer", run_on_startup=False)
+def deadletter_check(timer: func.TimerRequest):
+    """Log an error for each event Event Grid dead-lettered (it gave up delivering it to
+    kv_secret_expiry), so the dead-letter alert fires. Each blob is reported once."""
+    account_url = os.environ.get(DEADLETTER_ACCOUNT_URL)
+    container_name = os.environ.get(DEADLETTER_CONTAINER)
+    if not account_url or not container_name:
+        logging.error("%s or %s app setting is not set; cannot check for dead-lettered events", DEADLETTER_ACCOUNT_URL, DEADLETTER_CONTAINER)
+        return
+
+    container = BlobServiceClient(account_url, credential=credential).get_container_client(container_name)
+    for blob in container.list_blobs(include=["metadata"]):
+        metadata = blob.metadata or {}
+        if metadata.get(DEADLETTER_REPORTED):
+            continue
+        blob_client = container.get_blob_client(blob.name)
+        try:
+            events = json.loads(blob_client.download_blob().readall())
+        except ValueError:
+            events = []
+        for dead in events if isinstance(events, list) else [events]:
+            logging.error(
+                "Dead-lettered event: type=%s subject=%s version=%s reason=%s last_outcome=%s attempts=%s blob=%s",
+                dead.get("eventType"),
+                dead.get("subject"),
+                (dead.get("data") or {}).get("Version"),
+                dead.get("deadLetterReason"),
+                dead.get("lastDeliveryOutcome"),
+                dead.get("deliveryAttempts"),
+                blob.name,
+            )
+        if not events:
+            logging.error("Dead-lettered event (unreadable): blob=%s", blob.name)
+        blob_client.set_blob_metadata({**metadata, DEADLETTER_REPORTED: "true"})
 
 
 def subscription_of(resource_id: Optional[str]) -> Optional[str]:

@@ -144,8 +144,7 @@ Insights, the roles, and a policy that connects Key Vaults to the function. See 
 |---|---|---|
 | Key Vault Secrets Officer | each vault the policy connects (RBAC-mode vaults) | the policy |
 | Access policy `get`, `set` on secrets | each vault the policy connects (access-policy vaults) | the policy |
-| Storage Account Key Operator Service Role | each storage account it signs SAS for | Terraform, `rotation_storage_accounts` |
-| Reader | same accounts, unless every secret has `storage_rg` | Terraform |
+| `<prefix> SAS signer` (custom: read the account, list keys) | each storage account it signs SAS for | Terraform, `rotation_storage_accounts` |
 
 Add every storage account the function issues SAS tokens for to `rotation_storage_accounts`
 in `terraform.tfvars`, with its `subscription_id` if it is not in the subscription deployed into.
@@ -213,6 +212,12 @@ az storage blob list --account-name bigwxkvrotsri -c eventgrid-deadletter --auth
 
 Dead-lettering uses the storage account directly (no identity), so the account keeps shared key
 access and public network access enabled.
+
+The second function, `deadletter_check`, runs every 15 minutes. For each new blob in the
+dead-letter container it logs an error with the event type, secret, version, `deadLetterReason`
+and `lastDeliveryOutcome`, then marks the blob with `reported=true` metadata so it is reported
+once. That error triggers the `dead-lettered` email alert (see the infra README). It reads the
+container from the `DEADLETTER_ACCOUNT_URL` and `DEADLETTER_CONTAINER` app settings.
 
 ## Test
 
