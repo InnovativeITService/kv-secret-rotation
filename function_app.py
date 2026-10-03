@@ -283,10 +283,16 @@ def resolve_settings(tags: dict, existing: Optional[dict], from_name: dict) -> d
             "No storage account: no storage_account tag, the value is not a SAS URL, "
             "and the name is not sas-{storage-account}-{container}"
         )
-    if from_name.get("account") and account.lower() != from_name["account"]:
-        logging.warning("Secret name says account %s but the secret is for %s; using %s", from_name["account"], account, account)
+    # Account and container names are lowercase in Azure, and the SAS signature covers them as
+    # given, so a token signed for "MyAccount" is rejected. (Blob names are case-sensitive; keep them.)
+    account = account.lower()
+    account_source = "storage_account tag" if tags.get("storage_account") else "SAS URL"
+    check_matches_name("storage account", from_name.get("account"), account, account_source)
 
     container = tags.get("container") or (existing or {}).get("container") or from_name.get("container")
+    container = container.lower() if container else None
+    container_source = "container tag" if tags.get("container") else "SAS URL"
+    check_matches_name("container", from_name.get("container"), container, container_source)
     blob = (existing or {}).get("blob")
     sr = params.get("sr")
     # The name's container only decides the kind when there is no existing SAS to copy, so an
@@ -331,6 +337,16 @@ def resolve_settings(tags: dict, existing: Optional[dict], from_name: dict) -> d
         "response_headers": {kw: params[p] for p, kw in RESPONSE_HEADER_PARAMS.items() if params.get(p)},
         "lifetime": lifetime,
     }
+
+
+def check_matches_name(what: str, from_name: Optional[str], used: Optional[str], source: str) -> None:
+    """Stop when the secret name (sas-{storage-account}-{container}) disagrees with a tag or the SAS
+    URL. One of them is wrong, and rotating could put a token for the wrong resource in the secret."""
+    if from_name and used and used.lower() != from_name:
+        raise ManualRotationRequired(
+            f"Secret name says {what} {from_name} but the {source} says {used}; "
+            "fix whichever is wrong so they agree"
+        )
 
 
 def token_lifetime(tags: dict, params: dict) -> timedelta:

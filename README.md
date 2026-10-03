@@ -113,7 +113,14 @@ its `?`, and a bare token stays bare.
 
 Storage account names have no hyphens, so in `sas-{storage-account}-{container}` everything
 after the second hyphen is the container. The name only fills gaps: it never turns an account
-SAS into a container SAS, and a name that disagrees with the SAS URL is logged and ignored.
+SAS into a container SAS.
+
+If the name disagrees with a `storage_account` or `container` tag, or with the account or
+container in the SAS URL, the secret is **not rotated**. One of them is wrong, and rotating could
+put a token for the wrong resource into the secret. It logs, for example, `Secret name says
+storage account bigwxrgsrib6ac but the storage_account tag says other` and, with Jira on, raises
+a manual rotation ticket. Fix whichever is wrong. Comparisons ignore case. Names that don't follow
+`sas-…` have nothing to disagree with, so tags and the URL are used as they are.
 
 A value that is not a SAS is never rotated from the name alone, because there is no old token to
 copy permissions from; it needs a `storage_account` tag (and then gets the default settings).
