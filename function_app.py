@@ -61,7 +61,8 @@ MANUAL_STEPS = {
 # value, the secret name (sas-{storage-account}-{container}), then DEFAULTS. Tags:
 #   storage_account  storage account name (else from the SAS URL host, else the name)
 #   storage_rg       storage account resource group (else looked up by name)
-#   subscription_id  subscription of the storage account (else AZURE_SUBSCRIPTION_ID app setting)
+#   subscription_id  subscription of the storage account (else the vault's subscription, from the
+#                    event, else AZURE_SUBSCRIPTION_ID app setting)
 #   permissions      SAS permissions (sp)
 #   services         account SAS services (ss)
 #   resource_types   account SAS resource types (srt)
@@ -121,6 +122,8 @@ def kv_secret_expiry(event: func.EventGridEvent):
     vault_name = data.get("VaultName")
     secret_name = data.get("ObjectName")
     event_version = data.get("Version")
+    # The event's topic is the vault's resource ID, /subscriptions/<id>/resourceGroups/...
+    vault_subscription = subscription_of(event.topic)
 
     logging.info(
         "event_type=%s vault=%s secret=%s version=%s exp=%s",
@@ -163,7 +166,7 @@ def kv_secret_expiry(event: func.EventGridEvent):
     try:
         if rotate is None:
             raise ManualRotationRequired(f"Automatic rotation is not available for {secret_type} secrets")
-        new_value, expiry = rotate(secret_name, current.value, tags)
+        new_value, expiry = rotate(secret_name, current.value, tags, vault_subscription)
     except ManualRotationRequired as exc:
         logging.warning("Cannot rotate %s (%s): %s", secret_name, secret_type, exc)
         # Jira disabled while testing rotation; uncomment to raise tickets again
@@ -182,6 +185,14 @@ def kv_secret_expiry(event: func.EventGridEvent):
     # ticket_rotated(secrets, new.properties, secret_type)
 
 
+def subscription_of(resource_id: Optional[str]) -> Optional[str]:
+    """Subscription ID from an Azure resource ID, or None if it isn't one."""
+    parts = (resource_id or "").strip("/").split("/")
+    if len(parts) >= 2 and parts[0].lower() == "subscriptions" and parts[1]:
+        return parts[1]
+    return None
+
+
 def classify(name: str, tags: dict, value: Optional[str]) -> tuple:
     """Return the secret's type and where it came from (tag, name or value)."""
     tagged = (tags.get("secret_type") or "").strip().lower()
@@ -198,18 +209,19 @@ def classify(name: str, tags: dict, value: Optional[str]) -> tuple:
     return "unknown", "name and value"
 
 
-def rotate_storage_sas(name: str, value: Optional[str], tags: dict) -> tuple:
+def rotate_storage_sas(name: str, value: Optional[str], tags: dict, vault_subscription: Optional[str]) -> tuple:
     """Issue a new SAS with the same settings as the old one. Returns (new value, expiry)."""
     existing = parse_sas(value)
     # Without an old token there is nothing to copy permissions from; only issue one from
     # scratch (with DEFAULTS) when a storage_account tag asks for it explicitly
     if existing is None and "storage_account" not in tags:
         raise ManualRotationRequired("Value is not a SAS and the secret has no storage_account tag")
-    cfg = resolve_settings(tags, existing, sas_name_parts(name))
+    cfg = resolve_settings(tags, existing, sas_name_parts(name), vault_subscription)
     logging.info(
-        "Rotating %s: account=%s kind=%s container=%s blob=%s sp=%s ss=%s srt=%s sip=%s spr=%s lifetime=%s",
+        "Rotating %s: account=%s subscription=%s kind=%s container=%s blob=%s sp=%s ss=%s srt=%s sip=%s spr=%s lifetime=%s",
         name,
         cfg["account"],
+        cfg["subscription_id"],
         cfg["kind"],
         cfg["container"],
         cfg["blob"],
@@ -224,7 +236,9 @@ def rotate_storage_sas(name: str, value: Optional[str], tags: dict) -> tuple:
     return format_value(token, existing), expiry
 
 
-# Secret types the function can rotate. Every other type gets a manual rotation ticket.
+# Secret types the function can rotate. Every other type gets a manual rotation ticket. Each takes
+# (secret name, current value, tags, vault's subscription ID) and returns (new value, expiry), or
+# raises ManualRotationRequired.
 ROTATORS = {
     "storage-sas": rotate_storage_sas,
 }
@@ -266,7 +280,7 @@ def parse_sas(value: Optional[str]) -> Optional[dict]:
     return info
 
 
-def resolve_settings(tags: dict, existing: Optional[dict], from_name: dict) -> dict:
+def resolve_settings(tags: dict, existing: Optional[dict], from_name: dict, vault_subscription: Optional[str]) -> dict:
     params = existing["params"] if existing else {}
 
     if params.get("skoid"):
@@ -317,9 +331,12 @@ def resolve_settings(tags: dict, existing: Optional[dict], from_name: dict) -> d
             f"near expiry as soon as it is written; set an expiry_days tag of at least {MIN_LIFETIME.days}"
         )
 
-    subscription_id = tags.get("subscription_id") or os.environ.get("AZURE_SUBSCRIPTION_ID")
+    # Assume the storage account is in the vault's subscription unless a tag says otherwise
+    subscription_id = tags.get("subscription_id") or vault_subscription or os.environ.get("AZURE_SUBSCRIPTION_ID")
     if not subscription_id:
-        raise ManualRotationRequired("No subscription_id tag and AZURE_SUBSCRIPTION_ID app setting is not set")
+        raise ManualRotationRequired(
+            "No subscription_id tag, the event has no vault subscription, and AZURE_SUBSCRIPTION_ID is not set"
+        )
 
     return {
         "account": account,

@@ -44,7 +44,7 @@ The type comes from, in order:
 The prefix needs its hyphen, so `dbpassword` is `unknown`. Types without automatic rotation get
 a `manual_rotation_required` ticket whose `action` has the steps for that type.
 
-To add rotation for a type, write a function `(name, value, tags) -> (new value, expiry)` that
+To add rotation for a type, write a function `(name, value, tags, vault subscription) -> (new value, expiry)` that
 raises `ManualRotationRequired` when it can't rotate, and add it to `ROTATORS` in
 `function_app.py`.
 
@@ -96,7 +96,7 @@ start and expiry times.
 |---|---|---|---|
 | Storage account | `storage_account` | URL host (`<account>.blob.core.windows.net`), else the name | required |
 | Resource group | `storage_rg` | looked up by account name | |
-| Subscription | `subscription_id` | | `AZURE_SUBSCRIPTION_ID` app setting |
+| Subscription | `subscription_id` | | the vault's subscription (from the event), else `AZURE_SUBSCRIPTION_ID` |
 | Permissions | `permissions` | `sp` | `rl` |
 | Services (account SAS) | `services` | `ss` | `b` |
 | Resource types (account SAS) | `resource_types` | `srt` | `c` |
@@ -142,13 +142,15 @@ Insights, the roles, and a policy that connects Key Vaults to the function. See 
 
 | Function identity needs | Scope | Granted by |
 |---|---|---|
-| Key Vault Secrets Officer | subscription (RBAC-mode vaults) | Terraform |
-| Access policy `get`, `set` on secrets | each vault (access-policy vaults) | the policy |
+| Key Vault Secrets Officer | each vault the policy connects (RBAC-mode vaults) | the policy |
+| Access policy `get`, `set` on secrets | each vault the policy connects (access-policy vaults) | the policy |
 | Storage Account Key Operator Service Role | each storage account it signs SAS for | Terraform, `rotation_storage_accounts` |
 | Reader | same accounts, unless every secret has `storage_rg` | Terraform |
 
 Add every storage account the function issues SAS tokens for to `rotation_storage_accounts`
-in `terraform.tfvars`. A SAS for an account that isn't listed raises a manual rotation ticket
+in `terraform.tfvars`, with its `subscription_id` if it is not in the subscription deployed into.
+The function assumes a storage account is in the same subscription as the vault holding the
+secret; give the secret a `subscription_id` tag when it isn't. A SAS for an account that isn't listed raises a manual rotation ticket
 (403 listing keys).
 
 App settings (set by Terraform):
@@ -156,7 +158,7 @@ App settings (set by Terraform):
 | Setting | Purpose |
 |---|---|
 | `AZURE_CLIENT_ID` | which identity `DefaultAzureCredential` uses |
-| `AZURE_SUBSCRIPTION_ID` | default subscription for storage accounts (else the `subscription_id` tag) |
+| `AZURE_SUBSCRIPTION_ID` | fallback subscription for storage accounts, used only when there is no `subscription_id` tag and the event has no vault ID |
 | `JIRA_WEBHOOK_URL`, `JIRA_WEBHOOK_TOKEN` | Jira webhook (commented out while Jira is disabled) |
 
 ## Deploy
