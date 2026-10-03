@@ -15,20 +15,59 @@ from azure.storage.blob import generate_account_sas, generate_blob_sas, generate
 
 app = func.FunctionApp()
 
+# The Azure SDK logs every HTTP request and response at INFO; keep only its warnings and errors
+logging.getLogger("azure").setLevel(logging.WARNING)
+
 ROTATE_EVENT_TYPES = {
     "Microsoft.KeyVault.SecretNearExpiry",
     "Microsoft.KeyVault.SecretExpired",
 }
 
-# Each setting is taken from, in order: a tag on the secret, the existing SAS
-# in the secret value, then DEFAULTS. Tags:
-#   storage_account  storage account name (else from the SAS URL host)
+# Secret types, from the name prefix of the naming standard. A secret_type tag (one of the
+# values, or "unknown") overrides the name. A secret matching neither whose value is a SAS
+# is treated as storage-sas.
+#   sas-{storage-account}-{container}   storage-sas  SAS token
+#   spn-{app-name}-{purpose}            spn          service principal client secret
+#   db-{server}-{database}              database     database password
+#   api-{system}-{purpose}              api-key      API token
+#   ext-{vendor}-{keyname}              external     vendor or client credential
+#   anything else                       unknown
+NAME_PREFIXES = {
+    "sas": "storage-sas",
+    "spn": "spn",
+    "db": "database",
+    "api": "api-key",
+    "ext": "external",
+}
+SECRET_TYPES = set(NAME_PREFIXES.values()) | {"unknown"}
+
+# What the engineer does when a type can't be rotated automatically
+MANUAL_STEPS = {
+    "storage-sas": "Issue a new SAS for the same account and scope, save it as a new version of this secret, "
+    "then fix the cause below so the next rotation is automatic.",
+    "spn": "Add a new client secret to the app registration, save it as a new version of this secret, "
+    "move the consumers to it, then delete the old client secret.",
+    "database": "Set a new password for the database login, save it as a new version of this secret, "
+    "and update the consumers.",
+    "api-key": "Generate a new key in the issuing system, save it as a new version of this secret, "
+    "move the consumers to it, then revoke the old key.",
+    "external": "Request a new credential from the vendor or client, save it as a new version of this secret, "
+    "and confirm when the old one is retired.",
+    "unknown": "Work out what this secret is and rotate it. Rename it to the naming standard or add a "
+    "secret_type tag so future rotations are routed correctly.",
+}
+
+# SAS settings are taken from, in order: a tag on the secret, the existing SAS in the secret
+# value, the secret name (sas-{storage-account}-{container}), then DEFAULTS. Tags:
+#   storage_account  storage account name (else from the SAS URL host, else the name)
 #   storage_rg       storage account resource group (else looked up by name)
-#   subscription_id  subscription of the storage account (else AZURE_SUBSCRIPTION_ID app setting)
+#   subscription_id  subscription of the storage account (else the vault's subscription, from the
+#                    event, else AZURE_SUBSCRIPTION_ID app setting)
 #   permissions      SAS permissions (sp)
 #   services         account SAS services (ss)
 #   resource_types   account SAS resource types (srt)
-#   container        issue a container SAS for this container (else from sr=c and the SAS URL path)
+#   container        issue a container SAS for this container (else from sr=c and the SAS URL path,
+#                    else the name when the value is not a SAS)
 #   ip               allowed IP or range (sip)
 #   expiry_days      lifetime of the new token (else the old token's se - st)
 DEFAULTS = {
@@ -83,6 +122,8 @@ def kv_secret_expiry(event: func.EventGridEvent):
     vault_name = data.get("VaultName")
     secret_name = data.get("ObjectName")
     event_version = data.get("Version")
+    # The event's topic is the vault's resource ID, /subscriptions/<id>/resourceGroups/...
+    vault_subscription = subscription_of(event.topic)
 
     logging.info(
         "event_type=%s vault=%s secret=%s version=%s exp=%s",
@@ -102,6 +143,7 @@ def kv_secret_expiry(event: func.EventGridEvent):
     secrets = SecretClient(vault_url=f"https://{vault_name}.vault.azure.net", credential=credential)
     current = secrets.get_secret(secret_name)
     tags = current.properties.tags or {}
+    secret_type, type_source = classify(secret_name, tags, current.value)
 
     # Event Grid can deliver the same event more than once. If the latest version
     # is no longer the one that is expiring, it has already been rotated.
@@ -109,7 +151,7 @@ def kv_secret_expiry(event: func.EventGridEvent):
         # Jira disabled while testing rotation; uncomment to raise tickets again
         # if tags.get(ROTATED_FROM_TAG) == event_version and TICKET_TAG not in tags:
         #     logging.info("Rotated %s earlier but its ticket was not raised; raising it now", secret_name)
-        #     ticket_rotated(secrets, current.properties)
+        #     ticket_rotated(secrets, current.properties, secret_type)
         #     return
         logging.info(
             "Skipping %s: already rotated (event version %s, latest %s)",
@@ -119,22 +161,67 @@ def kv_secret_expiry(event: func.EventGridEvent):
         )
         return
 
+    logging.info("Secret %s is type %s (from %s)", secret_name, secret_type, type_source)
+    rotate = ROTATORS.get(secret_type)
     try:
-        existing = parse_sas(current.value)
-        if "storage_account" not in tags and existing is None:
-            raise ManualRotationRequired("Value is not a SAS and the secret has no storage_account tag")
-        cfg = resolve_settings(tags, existing)
-        token, expiry = build_sas(cfg)
+        if rotate is None:
+            raise ManualRotationRequired(f"Automatic rotation is not available for {secret_type} secrets")
+        new_value, expiry = rotate(secret_name, current.value, tags, vault_subscription)
     except ManualRotationRequired as exc:
-        logging.warning("Cannot rotate %s: %s", secret_name, exc)
+        logging.warning("Cannot rotate %s (%s): %s", secret_name, secret_type, exc)
         # Jira disabled while testing rotation; uncomment to raise tickets again
-        # ticket_manual_rotation(secrets, current.properties, event.event_type, str(exc))
+        # ticket_manual_rotation(secrets, current.properties, secret_type, event.event_type, str(exc))
         return
 
-    logging.info(
-        "Rotating %s: account=%s kind=%s container=%s blob=%s sp=%s ss=%s srt=%s sip=%s spr=%s lifetime=%s",
+    new = secrets.set_secret(
         secret_name,
+        new_value,
+        expires_on=expiry,
+        tags={**own_tags_removed(tags), ROTATED_FROM_TAG: current.properties.version},
+        content_type=current.properties.content_type,
+    )
+    logging.info("Rotated %s: new version %s expires %s", secret_name, new.properties.version, expiry.isoformat())
+    # Jira disabled while testing rotation; uncomment to raise tickets again
+    # ticket_rotated(secrets, new.properties, secret_type)
+
+
+def subscription_of(resource_id: Optional[str]) -> Optional[str]:
+    """Subscription ID from an Azure resource ID, or None if it isn't one."""
+    parts = (resource_id or "").strip("/").split("/")
+    if len(parts) >= 2 and parts[0].lower() == "subscriptions" and parts[1]:
+        return parts[1]
+    return None
+
+
+def classify(name: str, tags: dict, value: Optional[str]) -> tuple:
+    """Return the secret's type and where it came from (tag, name or value)."""
+    tagged = (tags.get("secret_type") or "").strip().lower()
+    if tagged in SECRET_TYPES:
+        return tagged, "secret_type tag"
+    if tagged:
+        logging.warning("Ignoring unrecognised secret_type tag %r on %s", tagged, name)
+
+    prefix, sep, _ = name.lower().partition("-")
+    if sep and prefix in NAME_PREFIXES:
+        return NAME_PREFIXES[prefix], "name"
+    if parse_sas(value):
+        return "storage-sas", "value"
+    return "unknown", "name and value"
+
+
+def rotate_storage_sas(name: str, value: Optional[str], tags: dict, vault_subscription: Optional[str]) -> tuple:
+    """Issue a new SAS with the same settings as the old one. Returns (new value, expiry)."""
+    existing = parse_sas(value)
+    # Without an old token there is nothing to copy permissions from; only issue one from
+    # scratch (with DEFAULTS) when a storage_account tag asks for it explicitly
+    if existing is None and "storage_account" not in tags:
+        raise ManualRotationRequired("Value is not a SAS and the secret has no storage_account tag")
+    cfg = resolve_settings(tags, existing, sas_name_parts(name), vault_subscription)
+    logging.info(
+        "Rotating %s: account=%s subscription=%s kind=%s container=%s blob=%s sp=%s ss=%s srt=%s sip=%s spr=%s lifetime=%s",
+        name,
         cfg["account"],
+        cfg["subscription_id"],
         cfg["kind"],
         cfg["container"],
         cfg["blob"],
@@ -145,17 +232,25 @@ def kv_secret_expiry(event: func.EventGridEvent):
         cfg["protocol"],
         cfg["lifetime"],
     )
+    token, expiry = build_sas(cfg)
+    return format_value(token, existing), expiry
 
-    new = secrets.set_secret(
-        secret_name,
-        format_value(token, existing),
-        expires_on=expiry,
-        tags={**own_tags_removed(tags), ROTATED_FROM_TAG: current.properties.version},
-        content_type=current.properties.content_type,
-    )
-    logging.info("Rotated %s: new version %s expires %s", secret_name, new.properties.version, expiry.isoformat())
-    # Jira disabled while testing rotation; uncomment to raise tickets again
-    # ticket_rotated(secrets, new.properties)
+
+# Secret types the function can rotate. Every other type gets a manual rotation ticket. Each takes
+# (secret name, current value, tags, vault's subscription ID) and returns (new value, expiry), or
+# raises ManualRotationRequired.
+ROTATORS = {
+    "storage-sas": rotate_storage_sas,
+}
+
+
+def sas_name_parts(name: str) -> dict:
+    """Account and container from a sas-{storage-account}-{container} name. Account names have no
+    hyphens, so everything after the second hyphen is the container (which may contain hyphens)."""
+    parts = name.lower().split("-", 2)
+    if len(parts) < 2 or parts[0] != "sas":
+        return {}
+    return {"account": parts[1] or None, "container": parts[2] if len(parts) == 3 else None}
 
 
 def parse_sas(value: Optional[str]) -> Optional[dict]:
@@ -185,7 +280,7 @@ def parse_sas(value: Optional[str]) -> Optional[dict]:
     return info
 
 
-def resolve_settings(tags: dict, existing: Optional[dict]) -> dict:
+def resolve_settings(tags: dict, existing: Optional[dict], from_name: dict, vault_subscription: Optional[str]) -> dict:
     params = existing["params"] if existing else {}
 
     if params.get("skoid"):
@@ -196,14 +291,27 @@ def resolve_settings(tags: dict, existing: Optional[dict]) -> dict:
     def pick(tag: str, param: Optional[str] = None):
         return tags.get(tag) or (params.get(param) if param else None) or DEFAULTS.get(tag)
 
-    account = tags.get("storage_account") or (existing or {}).get("account")
+    account = tags.get("storage_account") or (existing or {}).get("account") or from_name.get("account")
     if not account:
-        raise ManualRotationRequired("No storage_account tag and the existing SAS has no URL to take the account name from")
+        raise ManualRotationRequired(
+            "No storage account: no storage_account tag, the value is not a SAS URL, "
+            "and the name is not sas-{storage-account}-{container}"
+        )
+    # Account and container names are lowercase in Azure, and the SAS signature covers them as
+    # given, so a token signed for "MyAccount" is rejected. (Blob names are case-sensitive; keep them.)
+    account = account.lower()
+    account_source = "storage_account tag" if tags.get("storage_account") else "SAS URL"
+    check_matches_name("storage account", from_name.get("account"), account, account_source)
 
-    container = tags.get("container") or (existing or {}).get("container")
+    container = tags.get("container") or (existing or {}).get("container") or from_name.get("container")
+    container = container.lower() if container else None
+    container_source = "container tag" if tags.get("container") else "SAS URL"
+    check_matches_name("container", from_name.get("container"), container, container_source)
     blob = (existing or {}).get("blob")
     sr = params.get("sr")
-    if tags.get("container") or sr == "c":
+    # The name's container only decides the kind when there is no existing SAS to copy, so an
+    # account SAS named sas-{account}-{container} stays an account SAS
+    if tags.get("container") or sr == "c" or (not params and from_name.get("container")):
         kind = "container"
     elif sr == "b":
         kind = "blob"
@@ -212,7 +320,7 @@ def resolve_settings(tags: dict, existing: Optional[dict]) -> dict:
     else:
         raise ManualRotationRequired(f"Unsupported SAS resource sr={sr}")
     if kind in ("container", "blob") and not container:
-        raise ManualRotationRequired(f"{kind} SAS needs a container (container tag or SAS URL path)")
+        raise ManualRotationRequired(f"{kind} SAS needs a container (container tag, SAS URL path or secret name)")
     if kind == "blob" and not blob:
         raise ManualRotationRequired("Blob SAS needs the blob path from the SAS URL")
 
@@ -223,9 +331,12 @@ def resolve_settings(tags: dict, existing: Optional[dict]) -> dict:
             f"near expiry as soon as it is written; set an expiry_days tag of at least {MIN_LIFETIME.days}"
         )
 
-    subscription_id = tags.get("subscription_id") or os.environ.get("AZURE_SUBSCRIPTION_ID")
+    # Assume the storage account is in the vault's subscription unless a tag says otherwise
+    subscription_id = tags.get("subscription_id") or vault_subscription or os.environ.get("AZURE_SUBSCRIPTION_ID")
     if not subscription_id:
-        raise ManualRotationRequired("No subscription_id tag and AZURE_SUBSCRIPTION_ID app setting is not set")
+        raise ManualRotationRequired(
+            "No subscription_id tag, the event has no vault subscription, and AZURE_SUBSCRIPTION_ID is not set"
+        )
 
     return {
         "account": account,
@@ -243,6 +354,16 @@ def resolve_settings(tags: dict, existing: Optional[dict]) -> dict:
         "response_headers": {kw: params[p] for p, kw in RESPONSE_HEADER_PARAMS.items() if params.get(p)},
         "lifetime": lifetime,
     }
+
+
+def check_matches_name(what: str, from_name: Optional[str], used: Optional[str], source: str) -> None:
+    """Stop when the secret name (sas-{storage-account}-{container}) disagrees with a tag or the SAS
+    URL. One of them is wrong, and rotating could put a token for the wrong resource in the secret."""
+    if from_name and used and used.lower() != from_name:
+        raise ManualRotationRequired(
+            f"Secret name says {what} {from_name} but the {source} says {used}; "
+            "fix whichever is wrong so they agree"
+        )
 
 
 def token_lifetime(tags: dict, params: dict) -> timedelta:
@@ -341,7 +462,7 @@ def own_tags_removed(tags: dict) -> dict:
     return {k: v for k, v in tags.items() if k not in (TICKET_TAG, ROTATED_FROM_TAG)}
 
 
-def ticket_rotated(secrets: SecretClient, props) -> None:
+def ticket_rotated(secrets: SecretClient, props, secret_type: str) -> None:
     """Ask an engineer to get the consumers of a rotated secret onto the new value."""
     open_ticket(
         secrets,
@@ -349,15 +470,16 @@ def ticket_rotated(secrets: SecretClient, props) -> None:
         TICKET_ROTATED,
         {
             "outcome": "rotated",
-            "summary": f"Update consumers of rotated Key Vault secret {props.name} in {props.vault_url}",
-            "action": "The SAS was rotated automatically. Work with the users of this secret so they "
-            "pick up the new version before the previous token expires.",
+            "secretType": secret_type,
+            "summary": f"Update consumers of rotated {secret_type} secret {props.name} in {props.vault_url}",
+            "action": "The secret was rotated automatically. Work with the users of this secret so they "
+            "pick up the new version before the previous one expires.",
             "previousVersion": (props.tags or {}).get(ROTATED_FROM_TAG),
         },
     )
 
 
-def ticket_manual_rotation(secrets: SecretClient, props, event_type: str, reason: str) -> None:
+def ticket_manual_rotation(secrets: SecretClient, props, secret_type: str, event_type: str, reason: str) -> None:
     """Ask an engineer to rotate a secret the function couldn't rotate."""
     open_ticket(
         secrets,
@@ -365,9 +487,9 @@ def ticket_manual_rotation(secrets: SecretClient, props, event_type: str, reason
         event_type,
         {
             "outcome": "manual_rotation_required",
-            "summary": f"Rotate Key Vault secret {props.name} in {props.vault_url} manually",
-            "action": "The secret could not be rotated automatically. Rotate it manually, or fix the "
-            "cause below (for example add the missing tags) so the next rotation is automatic.",
+            "secretType": secret_type,
+            "summary": f"Rotate {secret_type} secret {props.name} in {props.vault_url} manually",
+            "action": MANUAL_STEPS[secret_type],
             "reason": reason,
             "eventType": event_type,
         },
